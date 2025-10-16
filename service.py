@@ -1,7 +1,11 @@
+from pymongo import MongoClient
 from typing import Dict, List, Tuple
-import datetime
+from datetime import datetime, timedelta
 import time
 
+client = MongoClient("mongodb://localhost:27017/")
+db = client.mydb
+movies_col = db.movies
 
 # DO NOT MODIFY THIS FUNCTION
 def measure(func):
@@ -17,106 +21,96 @@ def measure(func):
 
 
 @measure
-def search_movie(text):
+def search_movie(text,limit=25):
     """
     Search movies by title and sort the results using a custom score calculated as `textScore * popularity`.
     Also return facets for field `genre`, `releaseYear` and `votes`.
 
     Hint: check MongoDB's $facet stage
     """
-    return {
-        "genreFacet": [
-            {"_id": "Science Fiction", "count": 21},
-            {"_id": "Horror", "count": 10},
-            {"_id": "Action", "count": 9},
-            # ...
-            {"_id": "Drama", "count": 1},
-        ],
-        "releaseYearFacet": [
-            {"_id": 1979, "count": 1},
-            {"_id": 1986, "count": 1},
-            # ...
-            {"_id": 2022, "count": 1},
-            {"_id": 2023, "count": 2},
-        ],
-        "searchResults": [
-            {
-                "_id": 981314,
-                "poster_path": "/kaSvEH3RJvQa6NfAuEVqDMBEk5E.jpg",
-                "release_date": datetime.datetime(2023, 5, 11, 0, 0),
-                "score": 0.75,
-                "title": "Alien Invasion",
-                "vote_average": 5.542,
-                "vote_count": 48,
-            },
-            {
-                "_id": 126889,
-                "poster_path": "/zecMELPbU5YMQpC81Z8ImaaXuf9.jpg",
-                "release_date": datetime.datetime(2017, 5, 9, 0, 0),
-                "score": 0.75,
-                "title": "Alien: Covenant",
-                "vote_average": 6.1,
-                "vote_count": 7822,
-            },
-            # ...
-        ],
-        "votesFacet": [
-            {"_id": 0, "count": 2},
-            {"_id": 5, "count": 18},
-            {"_id": 7, "count": 4},
-            {"_id": 8, "count": 1},
-        ],
-    }
+    pipeline = [
+        {
+            "$match": {"title": {"$search": text}}
+        },
+        {
+            "$addFields": {
+                "score": {"$multiply": [{"$meta": "textScore"}, "$popularity"]}
+            }
+        },
+        {
+            "$sort": {"score": -1}
+        },
+        {
+            "$limit": limit
+        },
+        {
+            "$facet": {
+                "results": [
+                    {
+                        "$project": {
+                            "_id": 1,
+                            "title": 1,
+                            "genres": 1,
+                            "release_date": 1,
+                            "vote_count": 1,
+                            "popularity": 1,
+                            "score": 1
+                        }
+                    }
+                ],
+                "genre": [
+                    {"$unwind": "$genres"},
+                    {"$sortByCount": "$genres"}
+                ],
+                "releaseYear": [
+                    {
+                        "$addFields": {
+                            "year": {"$year": "$release_date"}
+                        }
+                    },
+                    {"$sortByCount": "$year"}
+                ],
+                "votes": [
+                    {
+                        "$bucket": {
+                            "groupBy": "$vote_count",
+                            "boundaries": [0, 50, 100, 500, 1000, 5000, 10000, 50000, 100000],
+                            "default": "100000+",
+                            "output": {"count": {"$sum": 1}}
+                        }
+                    }
+                ]
+            }
+        }
+    ]
+
+    result = list(movies_col.aggregate(pipeline))
+    if result:
+        return result[0]
+    else:
+        return {"results": [], "genre": [], "releaseYear": [], "votes": []}
 
 
 @measure
-def get_top_rated_movies():
+def get_top_rated_movies(top_n=25, min_votes=5000):
     """
     Return top rated 25 movies with more than 5k votes
     """
-    return [
-        {
-            "_id": 238,
-            "poster_path": "/3bhkrj58Vtu7enYsRolD1fZdja1.jpg",
-            "release_date": datetime.datetime(1972, 3, 14, 0, 0),
-            "title": "The Godfather",
-            "vote_average": 8.707,
-            "vote_count": 18677,
-        },
-        {
-            "_id": 278,
-            "poster_path": "/lyQBXzOQSuE59IsHyhrp0qIiPAz.jpg",
-            "release_date": datetime.datetime(1994, 9, 23, 0, 0),
-            "title": "The Shawshank Redemption",
-            "vote_average": 8.702,
-            "vote_count": 24649,
-        },
-    ]
+    cursor = movies_col.find({"vote_count": {"$gt": min_votes}}).sort("rating", -1).limit(top_n)
+    return list(cursor)
 
 
 @measure
-def get_recent_released_movies():
+def get_recent_released_movies(min_reviews=50, recent_days=1200):
     """
     Return recently released movies that at least are reviewed by 50 users
     """
-    return [
-        {
-            "_id": 1151534,
-            "poster_path": "/rpzFxv78UvYG5yQba2soO5mMl4T.jpg",
-            "release_date": datetime.datetime(2023, 9, 29, 0, 0),
-            "title": "Nowhere",
-            "vote_average": 7.895,
-            "vote_count": 195,
-        },
-        {
-            "_id": 866463,
-            "poster_path": "/soIgqZBoTiTgMqUW0JtxsPWAilQ.jpg",
-            "release_date": datetime.datetime(2023, 9, 29, 0, 0),
-            "title": "Reptile",
-            "vote_average": 7.354,
-            "vote_count": 65,
-        },
-    ]
+    cutoff_date = datetime.utcnow() - timedelta(days=recent_days)
+    cursor = movies_col.find({
+        "release_date": {"$gte": cutoff_date},
+        "vote_count": {"$gte": min_reviews}
+    }).sort("release_date", -1)
+    return list(cursor)
 
 
 @measure
@@ -124,21 +118,11 @@ def get_movie_details(movie_id):
     """
     Return detailed information for the specified movie_id
     """
-    return {
-        "_id": 238,
-        "genres": ["Drama", "Crime"],
-        "overview": "Spanning the years 1945 to 1955, a chronicle of the fictional "
-        "Italian-American Corleone crime family. When organized crime "
-        "family patriarch, Vito Corleone barely survives an attempt on "
-        "his life, his youngest son, Michael steps in to take care of the "
-        "would-be killers, launching a campaign of bloody revenge.",
-        "poster_path": "/3bhkrj58Vtu7enYsRolD1fZdja1.jpg",
-        "release_date": datetime.datetime(1972, 3, 14, 0, 0),
-        "tagline": "An offer you can't refuse.",
-        "title": "The Godfather",
-        "vote_average": 8.707,
-        "vote_count": 18677,
-    }
+    movie = movies_col.find_one({"_id": movie_id})
+    if movie:
+        return movie
+    else:
+        return None
 
 
 @measure
@@ -153,26 +137,17 @@ def get_same_genres_movies(movie_id, genres):
 
     Discard movies with votes by less than 500 users. Limit to 8 results.
     """
-    return [
-        {
-            "_id": 335,
-            "genres": 2,
-            "poster_path": "/qbYgqOczabWNn2XKwgMtVrntD6P.jpg",
-            "release_date": datetime.datetime(1968, 12, 21, 0, 0),
-            "title": "Once Upon a Time in the West",
-            "vote_average": 8.294,
-            "vote_count": 3923,
-        },
-        {
-            "_id": 3090,
-            "genres": 2,
-            "poster_path": "/pWcst7zVbi8Z8W6GFrdNE7HHRxL.jpg",
-            "release_date": datetime.datetime(1948, 1, 15, 0, 0),
-            "title": "The Treasure of the Sierra Madre",
-            "vote_average": 7.976,
-            "vote_count": 1066,
-        },
-    ]
+    if genres is None:
+        movie = movies_col.find_one({"_id": movie_id})
+        if not movie or "genres" not in movie:
+            return []
+        genres = movie["genres"]
+    
+    cursor = movies_col.find({
+        "genres": {"$in": genres},
+        "_id": {"$ne": movie_id}
+    })
+    return list(cursor)
 
 
 @measure
@@ -186,7 +161,7 @@ def get_similar_movies(movie_id):
             "_id": 335,
             "genres": 2,
             "poster_path": "/qbYgqOczabWNn2XKwgMtVrntD6P.jpg",
-            "release_date": datetime.datetime(1968, 12, 21, 0, 0),
+            "release_date": datetime(1968, 12, 21, 0, 0),
             "title": "Once Upon a Time in the West",
             "vote_average": 8.294,
             "vote_count": 3923,
@@ -195,7 +170,7 @@ def get_similar_movies(movie_id):
             "_id": 3090,
             "genres": 2,
             "poster_path": "/pWcst7zVbi8Z8W6GFrdNE7HHRxL.jpg",
-            "release_date": datetime.datetime(1948, 1, 15, 0, 0),
+            "release_date": datetime(1948, 1, 15, 0, 0),
             "title": "The Treasure of the Sierra Madre",
             "vote_average": 7.976,
             "vote_count": 1066,
@@ -220,7 +195,7 @@ def get_recommendations_for_user(username):
         {
             "_id": 496243,
             "poster_path": "/7IiTTgloJzvGI1TAYymCfbfl3vT.jpg",
-            "release_date": datetime.datetime(2019, 5, 30, 0, 0),
+            "release_date": datetime(2019, 5, 30, 0, 0),
             "title": "Parasite",
             "vote_average": 8.515,
             "vote_count": 16430,
