@@ -1,0 +1,37 @@
+<!doctype html>
+<title>{% block title %}{% endblock %} - The NoSQL Movie DB</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+<nav>
+  <h1><a href="/">The NoSQL Movie DB</a></h1>
+</nav>
+<section class="content">
+  <header>
+    <div style="display: flex">
+      <form action="/search">
+        <input name="query" type="text" placeholder="Search" />
+        <input type="submit" value="search" />
+      </form>
+
+      <div style="margin-left: 300px;">
+        {% if session and "username" in session %}
+          Current user : {{ session["username" ]}}
+        {% else %}
+          <form method="POST">
+            UPC Username <input type="text" name="username">
+          </form>
+        {% endif %}
+      </div>
+    </div>
+  </header>
+  {% for message in get_flashed_messages() %}
+    <div class="flash">{{ message }}</div>
+  {% endfor %}
+
+  {% block content %}{% endblock %}
+
+  <br>
+  Metrics:
+  {% for name, value in metrics.items() %}
+    <div>{{ name }}: p90 {{ '%0.2f' % (value[0] * 1000) }}ms p95 {{ '%0.2f' % (value[1] * 1000) }}ms</div>
+  {% endfor %}
+</section>

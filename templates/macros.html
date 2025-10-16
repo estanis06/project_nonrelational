@@ -1,0 +1,29 @@
+{% macro movie_item(movie) -%}
+  <div style="flex-shrink: 0; display: flex; width: 300px; padding: 5px; margin: 5px; border: 1px solid #eee;">
+    <img src="https://media.themoviedb.org/t/p/w94_and_h141_bestv2/{{ movie['poster_path'] }}" />
+    <div>
+      <strong><a href="/movie/{{ movie['_id'] }}">{{ movie["title"] }}</a></strong><br>
+      ⭐ {{ movie["vote_average"] }} <small>({{ movie["vote_count"] }})</small><br>
+      {{ movie["release_date"].date() if movie["release_date"] else "" }}
+
+      {% if movie.get("weightedScore") %}
+      <br>
+      <small>weightedScore: {{ movie["weightedScore"] }}</small>
+      {% endif %}
+
+      {% if movie.get("popularity") %}
+      <br>
+      <small>popularity: {{  movie.get("popularity") }}</small>
+      {% endif %}
+    </div>
+  </div>
+{%- endmacro %}
+
+
+{% macro facets(facets) -%}
+  <ul>
+  {% for facet in facets %}
+    <li>{{ facet["_id"] }}: {{ facet["count"] }}</li>
+  {% endfor %}
+  </ul>
+{%- endmacro %}

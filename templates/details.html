@@ -1,0 +1,42 @@
+{% extends 'base.html' %}
+
+{% import 'macros.html' as macros %}
+
+{% block title %}{{ movie["title"] }}{% endblock %}
+
+{% block content %}
+  <div style="display: flex; margin-top: 30px;">
+    <img src="https://media.themoviedb.org/t/p/w300_and_h450_bestv2/{{ movie['poster_path'] }}" />
+    <div>
+
+      <h2>{{ movie["title"] }}</h2>
+
+      ⭐ {{ movie["vote_average"] }} <small>({{ movie["vote_count"] }})</small><br>
+      {{ movie["release_date"] }}
+
+      <p>
+        <i>{{ movie["tagline"] }}</i>
+      </p>
+      Genres: {{ movie["genres"] }}
+      <p>
+        {{ movie["overview"] }}
+      </p>
+
+      Users who like this movie: {{ likes }}
+    </div>
+  </div>
+
+  <h2>Movies same genre</h2>
+  <div style="display: flex; flex-direction: row; flex-wrap: nowrap; overflow-x: scroll; width: 100%;">
+    {% for movie in same_genre %}
+      {{ macros.movie_item(movie) }}
+    {% endfor %}
+  </div>
+
+  <h2>Similar movies</h2>
+  <div style="display: flex; flex-direction: row; flex-wrap: nowrap; overflow-x: scroll; width: 100%;">
+    {% for movie in similar %}
+      {{ macros.movie_item(movie) }}
+    {% endfor %}
+  </div>
+{% endblock %}
