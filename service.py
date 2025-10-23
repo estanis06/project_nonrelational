@@ -2,10 +2,46 @@ from pymongo import MongoClient
 from typing import Dict, List, Tuple
 from datetime import datetime, timedelta
 import time
+import redis
+import numpy as np
+from pymongo import ASCENDING, DESCENDING
+import json
+import calendar
+from sentence_transformers import SentenceTransformer
+from redis.commands.search.query import Query
+from neo4j import GraphDatabase
 
 client = MongoClient("mongodb://localhost:27017/")
 db = client.mydb
 movies_col = db.movies
+r = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
+r_vec = redis.Redis(host='localhost', port=6379, db=0, decode_responses=False)
+r.flushall()
+movies_col.create_index(
+    [("rating", -1), ("title", 1), ("vote_count", 1)],
+    name="idx_top_rated_over5k",
+    partialFilterExpression={"vote_count": {"$gt": 5000}}
+)
+try:
+    model = SentenceTransformer("avsolatorio/GIST-small-Embedding-v0")
+    print("SentenceTransformer model loaded.")
+except Exception as e:
+    print(f"Error loading SentenceTransformer model: {e}")
+    model = None
+
+REDIS_INDEX_NAME = "plot_vector_idx"
+
+NEO4J_URI = "neo4j+s://6120e762.databases.neo4j.io" 
+NEO4J_USER = "neo4j"
+NEO4J_PASSWORD = "0qhEYtJQRHYFDi76O7ZOxSKPHw5ywNfi6Ba0Vqc9NVM" 
+
+try:
+    neo4j_driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+    neo4j_driver.verify_connectivity()
+    print("Successfully connected to Neo4j.")
+except Exception as e:
+    print(f"Failed to connect to Neo4j: {e}", file=sys.stderr)
+    neo4j_driver = None
 
 # DO NOT MODIFY THIS FUNCTION
 def measure(func):
@@ -30,7 +66,11 @@ def search_movie(text,limit=25):
     """
     pipeline = [
         {
-            "$match": {"title": {"$search": text}}
+            "$match": {
+                "$text": {
+                    "$search": text 
+                }
+            }
         },
         {
             "$addFields": {
@@ -45,7 +85,7 @@ def search_movie(text,limit=25):
         },
         {
             "$facet": {
-                "results": [
+                "searchResults": [
                     {
                         "$project": {
                             "_id": 1,
@@ -58,11 +98,11 @@ def search_movie(text,limit=25):
                         }
                     }
                 ],
-                "genre": [
+                "genreFacet": [
                     {"$unwind": "$genres"},
                     {"$sortByCount": "$genres"}
                 ],
-                "releaseYear": [
+                "releaseYearFacet": [
                     {
                         "$addFields": {
                             "year": {"$year": "$release_date"}
@@ -70,7 +110,7 @@ def search_movie(text,limit=25):
                     },
                     {"$sortByCount": "$year"}
                 ],
-                "votes": [
+                "votesFacet": [
                     {
                         "$bucket": {
                             "groupBy": "$vote_count",
@@ -88,16 +128,40 @@ def search_movie(text,limit=25):
     if result:
         return result[0]
     else:
-        return {"results": [], "genre": [], "releaseYear": [], "votes": []}
-
+        return {"searchResults": [], "genreFacet": [], "releaseYearFacet": [], "votesFacet": []}
 
 @measure
 def get_top_rated_movies(top_n=25, min_votes=5000):
     """
     Return top rated 25 movies with more than 5k votes
     """
-    cursor = movies_col.find({"vote_count": {"$gt": min_votes}}).sort("rating", -1).limit(top_n)
-    return list(cursor)
+    cache_key = f"top_rated:v1:n{top_n}:min{min_votes}"  # mateixa clau = mateix resultat
+    
+    cached = r.get(cache_key)
+    print("HIT" if cached else "MISS", cache_key)
+    if cached:
+        return json.loads(cached)
+
+
+    projection = {"_id": 1, "title": 1, "rating": 1, "vote_count": 1}
+    cursor = (
+        movies_col
+        .find({"vote_count": {"$gt": min_votes}}, projection)
+        .sort([("rating", DESCENDING), ("_id", 1)])  # tie-break estable
+        .limit(top_n)
+    )
+    
+    # 3) Convertir ObjectId a str abans de guardar a JSON
+    docs = [{"id": str(d["_id"]),
+             "title": d.get("title"),
+             "rating": d.get("rating"),
+             "vote_count": d.get("vote_count")} for d in cursor]
+
+    # 4) Guardar a Redis amb TTL (per ex. 300s) i retornar
+    r.setex(cache_key, 300, json.dumps(docs))
+
+
+    return docs
 
 
 @measure
@@ -108,10 +172,8 @@ def get_recent_released_movies(min_reviews=50, recent_days=1200):
     cutoff_date = datetime.utcnow() - timedelta(days=recent_days)
     cursor = movies_col.find({
         "release_date": {"$gte": cutoff_date},
-        "vote_count": {"$gte": min_reviews}
-    }).sort("release_date", -1)
+        "vote_count": {"$gte": min_reviews}}).sort("release_date", -1)
     return list(cursor)
-
 
 @measure
 def get_movie_details(movie_id):
@@ -156,26 +218,109 @@ def get_similar_movies(movie_id):
     Return a list of movies with a similar plot as the given movie_id.
     Movies need to be sorted by the popularity instead of proximity score.
     """
-    return [
-        {
-            "_id": 335,
-            "genres": 2,
-            "poster_path": "/qbYgqOczabWNn2XKwgMtVrntD6P.jpg",
-            "release_date": datetime(1968, 12, 21, 0, 0),
-            "title": "Once Upon a Time in the West",
-            "vote_average": 8.294,
-            "vote_count": 3923,
-        },
-        {
-            "_id": 3090,
-            "genres": 2,
-            "poster_path": "/pWcst7zVbi8Z8W6GFrdNE7HHRxL.jpg",
-            "release_date": datetime(1948, 1, 15, 0, 0),
-            "title": "The Treasure of the Sierra Madre",
-            "vote_average": 7.976,
-            "vote_count": 1066,
-        },
-    ]
+    if model is None:
+        print("Model not loaded, cannot find similar movies.")
+        return []
+
+    K = 10  # Number of similar movies to find
+    TARGET_MOVIE_KEY = f"movie:{movie_id}"
+    
+    try:
+        # 1. Get the embedding for the target movie
+        # Use r_vec to get raw bytes
+        target_embedding_bytes = r_vec.hget(TARGET_MOVIE_KEY, "embedding")
+        
+        if target_embedding_bytes:
+            # Movie is in Redis, use its stored embedding
+            query_vector = target_embedding_bytes
+        else:
+            # Movie not in Redis (e.g., < 500 votes).
+            # Fetch from Mongo, generate embedding on the fly.
+            print(f"Movie {movie_id} not in Redis. Generating embedding on the fly.")
+            
+            # movie_id from URL is likely an int, which matches _id
+            movie = movies_col.find_one({"_id": movie_id})
+            if not movie:
+                return []
+                
+            plot = movie.get("plot") or movie.get("overview")
+            if not plot:
+                return []
+                
+            # Generate embedding
+            embedding = model.encode(plot, normalize_embeddings=True)
+            query_vector = embedding.astype(np.float32).tobytes()
+
+        # 2. Build the KNN query
+        # This query finds the K+1 nearest neighbors (to include the movie itself)
+        query_string = f"(*=>[KNN {K+1} @embedding $vec as score])"
+        
+        q = (
+            Query(query_string)
+            .sort_by("score") # Sort by similarity score (ascending)
+            .return_field("_id") # Ask for the _id field
+            .return_field("score")
+            .dialect(2) # Use DIALECT 2 for KNN queries
+        )
+        
+        query_params = {"vec": query_vector}
+        
+        # 3. Execute the query using the r_vec connection
+        rs = r_vec.ft(REDIS_INDEX_NAME)
+        results = rs.search(q, query_params=query_params)
+        
+        # 4. Process results
+        similar_movie_ids = []
+        for doc in results.docs:
+            # doc._id will be bytes, so decode it
+            doc_id_str = doc._id.decode('utf-8') 
+            
+            # Exclude the movie itself from the results
+            if doc_id_str != str(movie_id):
+                try:
+                    similar_movie_ids.append(int(doc_id_str))
+                except ValueError:
+                    continue # Skip if _id is invalid
+        
+        if not similar_movie_ids:
+            return []
+
+        # 5. Fetch movie details from MongoDB
+        # We use an aggregation pipeline to fetch movies in the order
+        # returned by Redis (most similar first).
+        pipeline = [
+            {"$match": {"_id": {"$in": similar_movie_ids}}},
+            # Add a field to preserve the Redis sort order
+            {"$addFields": {
+                "__order": {"$indexOfArray": [similar_movie_ids, "$_id"]}
+            }},
+            {"$sort": {"__order": 1}},
+            # Project the fields needed for the carousel
+            {"$project": {
+                "_id": 1,
+                "title": 1,
+                "poster_path": 1,
+                "release_date": 1
+            }}
+        ]
+        
+        similar_movies = list(movies_col.aggregate(pipeline))
+        
+        # 6. Format data (convert ISODate to string like your placeholders)
+        for movie in similar_movies:
+            if isinstance(movie.get("release_date"), datetime):
+                movie["release_date"] = movie["release_date"].strftime("%Y-%m-%d")
+            # Convert datetime in placeholder to string
+            elif isinstance(movie.get("release_date"), dict) and "$date" in movie["release_date"]:
+                # Handle cases where $date is a dict from aggregate
+                timestamp = movie["release_date"]["$date"] / 1000
+                movie["release_date"] = datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d")
+
+        return similar_movies
+
+    except Exception as e:
+        print(f"Error in get_similar_movies: {e}")
+        return [] # Return empty list on error
 
 
 @measure
@@ -183,7 +328,40 @@ def get_movie_likes(username, movie_id):
     """
     Returns a list of usernames of users who also like the specified movie_id
     """
-    return ["username.of.another.student"]
+    if not neo4j_driver:
+        print("Neo4j driver not available.")
+        return []
+
+    # Ensure movie_id is an integer for the query
+    try:
+        movie_id_int = int(movie_id)
+    except (ValueError, TypeError):
+        return [] # Return empty if movie_id is invalid
+
+    query = """
+    // Find the movie by its tmdb_id
+    MATCH (m:Movie {tmdb_id: $movie_id})
+    
+    // Find users who like that movie
+    MATCH (m)<-[:LIKES]-(u:User)
+    
+    // Exclude the original user
+    WHERE u.username <> $username
+    
+    // Return their usernames, up to a limit of 10
+    RETURN u.username AS username
+    LIMIT 10
+    """
+    
+    try:
+        with neo4j_driver.session() as session:
+            result = session.run(query, movie_id=movie_id_int, username=username)
+            # Collect usernames from the result records
+            usernames = [record["username"] for record in result]
+            return usernames
+    except Exception as e:
+        print(f"Error in get_movie_likes: {e}")
+        return []
 
 
 @measure
@@ -191,27 +369,147 @@ def get_recommendations_for_user(username):
     """
     Return up to 10 movies based on similar users taste.
     """
-    return [
-        {
-            "_id": 496243,
-            "poster_path": "/7IiTTgloJzvGI1TAYymCfbfl3vT.jpg",
-            "release_date": datetime(2019, 5, 30, 0, 0),
-            "title": "Parasite",
-            "vote_average": 8.515,
-            "vote_count": 16430,
-        }
-    ]
+    if not neo4j_driver:
+        print("Neo4j driver not available.")
+        return []
+
+    # This Cypher query implements all 5 steps from the project description:
+    # 1. Find users with common likes
+    # 2. Compute Jaccard similarity
+    # 3. Select top K neighbors
+    # 4. Find movies neighbors liked (that active user has not)
+    # 5. Rank movies by likes
+    query = """
+    // 1. Find the active user and their liked movies
+    MATCH (activeUser:User {username: $username})-[:LIKES]->(activeMovie:Movie)
+    WITH activeUser, collect(activeMovie) AS activeUserMovies
+
+    // 2. Find neighbors who share at least one movie
+    MATCH (neighbor:User)-[:LIKES]->(commonMovie:Movie)
+    WHERE neighbor <> activeUser AND commonMovie IN activeUserMovies
+    WITH activeUser, activeUserMovies, neighbor, collect(commonMovie) AS commonMovies
+
+    // 3. Get all movies for the neighbor
+    MATCH (neighbor)-[:LIKES]->(neighborMovie:Movie)
+    WITH activeUser, activeUserMovies, neighbor, commonMovies, collect(neighborMovie) AS neighborMovies
+
+    // 4. Calculate Jaccard similarity
+    WITH activeUser, 
+         activeUserMovies, 
+         neighbor, 
+         size(commonMovies) AS intersection,
+         size(activeUserMovies) + size(neighborMovies) - size(commonMovies) AS union
+    WHERE union > 0 // Avoid division by zero
+    WITH activeUser, 
+         activeUserMovies, 
+         neighbor, 
+         toFloat(intersection) / toFloat(union) AS jaccard
+         
+    // 5. Get top K neighbors (k=10)
+    ORDER BY jaccard DESC
+    LIMIT 10 
+    WITH activeUser, activeUserMovies, collect(neighbor) AS topNeighbors
+
+    // 6. Unwind the neighbors list
+    UNWIND topNeighbors AS topNeighbor
+
+    // 7. Find movies liked by these neighbors
+    MATCH (topNeighbor)-[:LIKES]->(recommendedMovie:Movie)
+
+    // 8. Filter out movies the active user already likes
+    WHERE NOT recommendedMovie IN activeUserMovies
+
+    // 9. Rank by number of likes from the neighbor group
+    WITH recommendedMovie, count(recommendedMovie) AS recommendationScore
+    ORDER BY recommendationScore DESC
+    LIMIT 10 // Top 10 movie recommendations
+
+    // 10. Return just the movie ID (which is the _id in MongoDB)
+    RETURN recommendedMovie.tmdb_id AS _id
+    """
+    
+    recommended_movie_ids = []
+    try:
+        # Execute the query to get ordered movie IDs
+        with neo4j_driver.session() as session:
+            result = session.run(query, username=username)
+            recommended_movie_ids = [record["_id"] for record in result]
+            
+    except Exception as e:
+        print(f"Error in get_recommendations_for_user (Neo4j query): {e}")
+        return []
+
+    if not recommended_movie_ids:
+        # No recommendations found
+        return []
+
+    # Now, fetch the full movie details from MongoDB,
+    # preserving the order from the Neo4j query.
+    try:
+        pipeline = [
+            {"$match": {"_id": {"$in": recommended_movie_ids}}},
+            # Add a field to preserve the Neo4j sort order
+            {"$addFields": {
+                "__order": {"$indexOfArray": [recommended_movie_ids, "$_id"]}
+            }},
+            {"$sort": {"__order": 1}},
+            # Project to match the format of other functions
+            {"$project": {
+                "_id": 1,
+                "title": 1,
+                "poster_path": 1,
+                "release_date": 1,
+                "vote_average": 1,
+                "vote_count": 1
+            }}
+        ]
+        
+        recommended_movies = list(movies_col.aggregate(pipeline))
+
+        # Format release_date to string if it's a datetime object
+        # (This matches the format of your other service functions)
+        for movie in recommended_movies:
+            if isinstance(movie.get("release_date"), datetime):
+                movie["release_date"] = movie["release_date"].strftime("%Y-%m-%d")
+
+        return recommended_movies
+
+    except Exception as e:
+        print(f"Error in get_recommendations_for_user (MongoDB query): {e}")
+        return []
 
 
 def get_metrics(metrics_names: List) -> Dict[str, Tuple[float, float]]:
     """
     Return 95th percentile in seconds for each one of the given metric names
     """
-    return {name: (0.9, 0.95) for name in metrics_names}
+    results = {}
+    for name in metrics_names:
+        key = f"metric:{name}"
+        
+        # 1. Retrieve all stored measurements (as strings)
+        raw_measures = r.lrange(key, 0, -1)
+        
+        if not raw_measures:
+            results[name] = (0.0, 0.0)
+            continue
+
+        # 2. Convert to float array for NumPy calculation
+        measures = np.array([float(m) for m in raw_measures])
+        
+        # 3. Calculate 90th and 95th percentiles
+        p90 = np.percentile(measures, 90)
+        p95 = np.percentile(measures, 95)
+        
+        # Return percentiles as a tuple of floats (ms)
+        results[name] = (p90, p95)
+        
+    return results
 
 
 def store_metric(metric_name: str, measure_s: float):
     """
     Store mesured sample in seconds of the given metric
     """
-    pass
+    r.rpush(f"metric:{metric_name}", measure_s) # Store in milliseconds for clarity
+
