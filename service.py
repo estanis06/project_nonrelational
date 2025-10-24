@@ -16,12 +16,11 @@ db = client.mydb
 movies_col = db.movies
 r = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
 r_vec = redis.Redis(host='localhost', port=6379, db=0, decode_responses=False)
-r.flushall()
 movies_col.create_index(
-    [("rating", -1), ("title", 1), ("vote_count", 1)],
-    name="idx_top_rated_over5k",
-    partialFilterExpression={"vote_count": {"$gt": 5000}}
+    [("genres", ASCENDING), ("vote_count", ASCENDING), ("vote_average", DESCENDING)],
+    name="idx_same_genres_vote"
 )
+
 try:
     model = SentenceTransformer("avsolatorio/GIST-small-Embedding-v0")
     print("SentenceTransformer model loaded.")
@@ -90,11 +89,12 @@ def search_movie(text,limit=25):
                         "$project": {
                             "_id": 1,
                             "title": 1,
-                            "genres": 1,
-                            "release_date": 1,
+                            "poster_path": 1,
+                            "release_date": {"$dateToString": {"format": "%Y-%m-%d", "date": "$release_date"}},
+                            "vote_average": 1, 
                             "vote_count": 1,
                             "popularity": 1,
-                            "score": 1
+                            "weightedScore": 1,
                         }
                     }
                 ],
@@ -143,19 +143,49 @@ def get_top_rated_movies(top_n=25, min_votes=5000):
         return json.loads(cached)
 
 
-    projection = {"_id": 1, "title": 1, "rating": 1, "vote_count": 1}
+    projection = {
+            "_id": 1,
+            "title": 1,
+            "poster_path": 1,
+            "release_date": 1,
+            "vote_average": 1, 
+            "vote_count": 1,
+            "popularity": 1,
+            "weightedScore": 1,
+            "rating":1
+        }    
     cursor = (
-        movies_col
-        .find({"vote_count": {"$gt": min_votes}}, projection)
-        .sort([("rating", DESCENDING), ("_id", 1)])  # tie-break estable
-        .limit(top_n)
+            movies_col
+            .find({"vote_count": {"$gt": min_votes}}, projection)
+            .sort([("vote_average", DESCENDING), ("_id", 1)])
+            .limit(top_n)
     )
     
-    # 3) Convertir ObjectId a str abans de guardar a JSON
-    docs = [{"id": str(d["_id"]),
-             "title": d.get("title"),
-             "rating": d.get("rating"),
-             "vote_count": d.get("vote_count")} for d in cursor]
+
+
+
+    docs = []
+    for d in cursor:
+        # normalitza release_date a string YYYY-MM-DD
+        rd = d.get("release_date")
+        if isinstance(rd, datetime):
+            rd = rd.strftime("%Y-%m-%d")
+
+        # normalitza vote_average: si no hi és, agafa "rating"
+        va = d.get("vote_average")
+        if va is None and d.get("rating") is not None:
+            va = float(d.get("rating"))
+
+        docs.append({
+            "_id": str(d["_id"]),                # el macro vol "_id"
+            "title": d.get("title"),
+            "poster_path": d.get("poster_path"),
+            "release_date": rd if rd else None,  # el macro mostra buit si None
+            "vote_average": float(va) if va is not None else None,
+            "vote_count": int(d.get("vote_count", 0)) if d.get("vote_count") is not None else None,
+            "popularity": float(d.get("popularity")) if d.get("popularity") is not None else None,
+            "weightedScore": float(d.get("weightedScore")) if d.get("weightedScore") is not None else None
+        })
 
     # 4) Guardar a Redis amb TTL (per ex. 300s) i retornar
     r.setex(cache_key, 300, json.dumps(docs))
@@ -169,10 +199,60 @@ def get_recent_released_movies(min_reviews=50, recent_days=1200):
     """
     Return recently released movies that at least are reviewed by 50 users
     """
+    cache_key = f"recent_released:v1:min{min_reviews}:days{recent_days}"
+    
+    cached = r.get(cache_key)
+    print("HIT" if cached else "MISS", cache_key)
+    if cached:
+        return json.loads(cached)
+
     cutoff_date = datetime.utcnow() - timedelta(days=recent_days)
+    
+    projection = {
+            "_id": 1,
+            "title": 1,
+            "poster_path": 1,
+            "release_date": 1,
+            "vote_average": 1, 
+            "vote_count": 1,
+            "popularity": 1,
+            "weightedScore": 1,
+            "rating":1
+        }    
+
+
+    
     cursor = movies_col.find({
         "release_date": {"$gte": cutoff_date},
         "vote_count": {"$gte": min_reviews}}).sort("release_date", -1)
+
+    docs = []
+    for d in cursor:
+        # normalitza release_date a string YYYY-MM-DD
+        rd = d.get("release_date")
+        if isinstance(rd, datetime):
+            rd = rd.strftime("%Y-%m-%d")
+
+        # normalitza vote_average: si no hi és, agafa "rating"
+        va = d.get("vote_average")
+        if va is None and d.get("rating") is not None:
+            va = float(d.get("rating"))
+
+        docs.append({
+            "_id": str(d["_id"]),                # el macro vol "_id"
+            "title": d.get("title"),
+            "poster_path": d.get("poster_path"),
+            "release_date": rd if rd else None,  # el macro mostra buit si None
+            "vote_average": float(va) if va is not None else None,
+            "vote_count": int(d.get("vote_count", 0)) if d.get("vote_count") is not None else None,
+            "popularity": float(d.get("popularity")) if d.get("popularity") is not None else None,
+            "weightedScore": float(d.get("weightedScore")) if d.get("weightedScore") is not None else None
+        })
+
+
+
+    r.setex(cache_key, 300, json.dumps(docs))
+
     return list(cursor)
 
 @measure
@@ -180,11 +260,47 @@ def get_movie_details(movie_id):
     """
     Return detailed information for the specified movie_id
     """
-    movie = movies_col.find_one({"_id": movie_id})
-    if movie:
-        return movie
-    else:
+    movie_id_str = str(movie_id)
+    cache_key = f"movie:details:v1:{movie_id_str}"
+    cached = r.get(cache_key)
+    if cached:
+        return json.loads(cached)
+
+    projection = {
+        "_id": 1,
+        "poster_path":1,
+        "title": 1,
+        "vote_average": 1,
+        "vote_count": 1,
+        "release_date": 1,
+        "tagline": 1,
+        "genres": 1,
+        "overview": 1
+    }
+
+
+    doc = movies_col.find_one({"_id": movie_id}, projection)
+    if not doc:
         return None
+    
+    rd = doc.get("release_date")
+    if isinstance(rd, datetime):
+        rd = rd.strftime("%Y-%m-%d")
+
+    movie = {
+        "id": str(doc["_id"]),
+        "title": doc.get("title"),
+        "poster_path":doc.get("poster_path"),
+        "vote_average": doc.get("vote_average"),
+        "vote_count": doc.get("vote_count"),
+        "release_date": rd if rd else None,
+        "tagline": doc.get("tagline"),
+        "genres": doc.get("genres"),
+        "overview": doc.get("overview"),
+    }
+
+    r.setex(cache_key, 600, json.dumps(movie))
+    return movie
 
 
 @measure
@@ -205,11 +321,62 @@ def get_same_genres_movies(movie_id, genres):
             return []
         genres = movie["genres"]
     
-    cursor = movies_col.find({
-        "genres": {"$in": genres},
-        "_id": {"$ne": movie_id}
-    })
-    return list(cursor)
+    genres_key=";".join(sorted(genres))
+
+    
+
+    cache_key=f"same_genres:v1:{movie_id}:{genres_key}"
+    cached=r.get(cache_key)
+    if cached:
+        return json.loads(cached)
+
+
+    pipeline = [
+        {"$match": {
+            "genres": {"$in": genres},
+            "_id": {"$ne": movie_id},
+            "vote_count": {"$gte": 500}
+        }},
+        {"$addFields": {
+            "matchCount": {"$size": {"$setIntersection": ["$genres", genres]}}
+        }},
+        {"$sort": {"matchCount": -1, "rating": -1, "_id": 1}},
+        {"$limit": 8},
+        {"$project": {
+            "_id": 1, "title": 1, "vote_count": 1, "vote_average":1,
+            "poster_path": 1, "release_date": 1, "weightedScore":1,"popularity":1
+        }}
+    ]
+
+
+    docs = list(movies_col.aggregate(pipeline))
+    
+    movies = []
+    for d in docs:
+        rd = d.get("release_date")
+        if isinstance(rd, datetime):
+            rd = rd.strftime("%Y-%m-%d")
+
+        va = d.get("vote_average")
+        if va is None and d.get("rating") is not None:
+            va = float(d.get("rating"))
+
+
+        movies.append({
+            "_id": str(d["_id"]),                # el macro vol "_id"
+            "title": d.get("title"),
+            "poster_path": d.get("poster_path"),
+            "release_date": rd if rd else None,  # el macro mostra buit si None
+            "vote_average": float(va) if va is not None else None,
+            "vote_count": int(d.get("vote_count", 0)) if d.get("vote_count") is not None else None,
+            "popularity": float(d.get("popularity")) if d.get("popularity") is not None else None,
+            "weightedScore": float(d.get("weightedScore")) if d.get("weightedScore") is not None else None
+        })
+
+    # --- Guarda a la caché (TTL 300s) ---
+    r.setex(cache_key, 300, json.dumps(movies))
+
+    return movies
 
 
 @measure
@@ -223,13 +390,21 @@ def get_similar_movies(movie_id):
         return []
 
     K = 10  # Number of similar movies to find
+
+    cache_key = f"similar_movies:v2:{movie_id}:k{K}"
+
+    # 1) Cache HIT?
+    cached = r.get(cache_key)
+    print("HIT" if cached else "MISS", cache_key)
+    if cached:
+        return json.loads(cached)
+
     TARGET_MOVIE_KEY = f"movie:{movie_id}"
-    
     try:
         # 1. Get the embedding for the target movie
         # Use r_vec to get raw bytes
         target_embedding_bytes = r_vec.hget(TARGET_MOVIE_KEY, "embedding")
-        
+
         if target_embedding_bytes:
             # Movie is in Redis, use its stored embedding
             query_vector = target_embedding_bytes
@@ -253,28 +428,34 @@ def get_similar_movies(movie_id):
 
         # 2. Build the KNN query
         # This query finds the K+1 nearest neighbors (to include the movie itself)
-        query_string = f"(*=>[KNN {K+1} @embedding $vec as score])"
+        query_string = f"*=>[KNN {K+1} @embedding $vec AS score]"
+        
         
         q = (
             Query(query_string)
             .sort_by("score") # Sort by similarity score (ascending)
-            .return_field("_id") # Ask for the _id field
+            .return_field("movie_id") # Ask for the _id field
             .return_field("score")
             .dialect(2) # Use DIALECT 2 for KNN queries
         )
-        
         query_params = {"vec": query_vector}
         
         # 3. Execute the query using the r_vec connection
         rs = r_vec.ft(REDIS_INDEX_NAME)
+
+        
         results = rs.search(q, query_params=query_params)
         
+
+
         # 4. Process results
         similar_movie_ids = []
         for doc in results.docs:
             # doc._id will be bytes, so decode it
-            doc_id_str = doc._id.decode('utf-8') 
-            
+
+
+            doc_id_str = doc.movie_id
+
             # Exclude the movie itself from the results
             if doc_id_str != str(movie_id):
                 try:
@@ -288,6 +469,7 @@ def get_similar_movies(movie_id):
         # 5. Fetch movie details from MongoDB
         # We use an aggregation pipeline to fetch movies in the order
         # returned by Redis (most similar first).
+
         pipeline = [
             {"$match": {"_id": {"$in": similar_movie_ids}}},
             # Add a field to preserve the Redis sort order
@@ -300,23 +482,45 @@ def get_similar_movies(movie_id):
                 "_id": 1,
                 "title": 1,
                 "poster_path": 1,
-                "release_date": 1
+                "release_date": 1,
+                "vote_average": 1, 
+                "vote_count": 1,
+                "popularity": 1,
+                "weightedScore": 1,
+                "rating":1
             }}
         ]
         
         similar_movies = list(movies_col.aggregate(pipeline))
         
+        movies = []
+
+
         # 6. Format data (convert ISODate to string like your placeholders)
         for movie in similar_movies:
-            if isinstance(movie.get("release_date"), datetime):
-                movie["release_date"] = movie["release_date"].strftime("%Y-%m-%d")
-            # Convert datetime in placeholder to string
-            elif isinstance(movie.get("release_date"), dict) and "$date" in movie["release_date"]:
-                # Handle cases where $date is a dict from aggregate
-                timestamp = movie["release_date"]["$date"] / 1000
-                movie["release_date"] = datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d")
+            # normalitza release_date a string YYYY-MM-DD
+            rd = movie.get("release_date")
+            if isinstance(rd, datetime):
+                rd = rd.strftime("%Y-%m-%d")
 
-        return similar_movies
+            # normalitza vote_average: si no hi és, agafa "rating"
+            va = movie.get("vote_average")
+            if va is None and movie.g("rating") is not None:
+                va = float(movie.g("rating"))
+
+            movies.append({
+                "_id": str(movie["_id"]),                # el macro vol "_id"
+                "title": movie.get("title"),
+                "poster_path": movie.get("poster_path"),
+                "release_date": rd if rd else None,  # el macro mostra buit si None
+                "vote_average": float(va) if va is not None else None,
+                "vote_count": int(movie.get("vote_count", 0)) if movie.get("vote_count") is not None else None,
+                "popularity": float(movie.get("popularity")) if movie.get("popularity") is not None else None,
+                "weightedScore": float(movie.get("weightedScore")) if movie.get("weightedScore") is not None else None
+            })
+
+        r.setex(cache_key, 600, json.dumps(movies))
+        return movies
 
     except Exception as e:
         print(f"Error in get_similar_movies: {e}")
@@ -331,6 +535,12 @@ def get_movie_likes(username, movie_id):
     if not neo4j_driver:
         print("Neo4j driver not available.")
         return []
+
+    cache_key = f"movie_likes:v1:u:{username}:m:{movie_id}"
+    cached = r.get(cache_key)
+    print("HIT" if cached else "MISS", cache_key)
+    if cached:
+        return json.loads(cached)
 
     # Ensure movie_id is an integer for the query
     try:
@@ -358,6 +568,7 @@ def get_movie_likes(username, movie_id):
             result = session.run(query, movie_id=movie_id_int, username=username)
             # Collect usernames from the result records
             usernames = [record["username"] for record in result]
+            r.setex(cache_key, 300, json.dumps(usernames))
             return usernames
     except Exception as e:
         print(f"Error in get_movie_likes: {e}")
@@ -372,6 +583,12 @@ def get_recommendations_for_user(username):
     if not neo4j_driver:
         print("Neo4j driver not available.")
         return []
+
+    cache_key = f"reco_user:v1:{username}"
+    cached = r.get(cache_key)
+    print("HIT" if cached else "MISS", cache_key)
+    if cached:
+        return json.loads(cached)
 
     # This Cypher query implements all 5 steps from the project description:
     # 1. Find users with common likes
@@ -471,6 +688,9 @@ def get_recommendations_for_user(username):
         for movie in recommended_movies:
             if isinstance(movie.get("release_date"), datetime):
                 movie["release_date"] = movie["release_date"].strftime("%Y-%m-%d")
+            movie["_id"] = str(movie["_id"])
+        
+        r.setex(cache_key, 600, json.dumps(recommended_movies))
 
         return recommended_movies
 
