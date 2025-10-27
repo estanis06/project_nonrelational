@@ -135,7 +135,7 @@ def get_top_rated_movies(top_n=25, min_votes=5000):
     """
     Return top rated 25 movies with more than 5k votes
     """
-    cache_key = f"top_rated:v1:n{top_n}:min{min_votes}"  # mateixa clau = mateix resultat
+    cache_key = f"top_rated:v1:n{top_n}:min{min_votes}" 
     
     cached = r.get(cache_key)
     print("HIT" if cached else "MISS", cache_key)
@@ -160,42 +160,15 @@ def get_top_rated_movies(top_n=25, min_votes=5000):
             .sort([("vote_average", DESCENDING), ("_id", 1)])
             .limit(top_n)
     )
-    
+    docs = [parse_movie_document(d) for d in cursor]
 
-
-
-    docs = []
-    for d in cursor:
-        # normalitza release_date a string YYYY-MM-DD
-        rd = d.get("release_date")
-        if isinstance(rd, datetime):
-            rd = rd.strftime("%Y-%m-%d")
-
-        # normalitza vote_average: si no hi és, agafa "rating"
-        va = d.get("vote_average")
-        if va is None and d.get("rating") is not None:
-            va = float(d.get("rating"))
-
-        docs.append({
-            "_id": str(d["_id"]),                # el macro vol "_id"
-            "title": d.get("title"),
-            "poster_path": d.get("poster_path"),
-            "release_date": rd if rd else None,  # el macro mostra buit si None
-            "vote_average": float(va) if va is not None else None,
-            "vote_count": int(d.get("vote_count", 0)) if d.get("vote_count") is not None else None,
-            "popularity": float(d.get("popularity")) if d.get("popularity") is not None else None,
-            "weightedScore": float(d.get("weightedScore")) if d.get("weightedScore") is not None else None
-        })
-
-    # 4) Guardar a Redis amb TTL (per ex. 300s) i retornar
     r.setex(cache_key, 300, json.dumps(docs))
-
 
     return docs
 
 
 @measure
-def get_recent_released_movies(min_reviews=50, recent_days=1200):
+def get_recent_released_movies(min_reviews=50, recent_days=800):
     """
     Return recently released movies that at least are reviewed by 50 users
     """
@@ -226,30 +199,7 @@ def get_recent_released_movies(min_reviews=50, recent_days=1200):
         "release_date": {"$gte": cutoff_date},
         "vote_count": {"$gte": min_reviews}}).sort("release_date", -1)
 
-    docs = []
-    for d in cursor:
-        # normalitza release_date a string YYYY-MM-DD
-        rd = d.get("release_date")
-        if isinstance(rd, datetime):
-            rd = rd.strftime("%Y-%m-%d")
-
-        # normalitza vote_average: si no hi és, agafa "rating"
-        va = d.get("vote_average")
-        if va is None and d.get("rating") is not None:
-            va = float(d.get("rating"))
-
-        docs.append({
-            "_id": str(d["_id"]),                # el macro vol "_id"
-            "title": d.get("title"),
-            "poster_path": d.get("poster_path"),
-            "release_date": rd if rd else None,  # el macro mostra buit si None
-            "vote_average": float(va) if va is not None else None,
-            "vote_count": int(d.get("vote_count", 0)) if d.get("vote_count") is not None else None,
-            "popularity": float(d.get("popularity")) if d.get("popularity") is not None else None,
-            "weightedScore": float(d.get("weightedScore")) if d.get("weightedScore") is not None else None
-        })
-
-
+    docs = [parse_movie_document(d) for d in cursor]
 
     r.setex(cache_key, 300, json.dumps(docs))
 
@@ -280,26 +230,12 @@ def get_movie_details(movie_id):
 
 
     doc = movies_col.find_one({"_id": movie_id}, projection)
-    if not doc:
-        return None
     
-    rd = doc.get("release_date")
-    if isinstance(rd, datetime):
-        rd = rd.strftime("%Y-%m-%d")
+    movie = parse_movie_document(doc)
 
-    movie = {
-        "id": str(doc["_id"]),
-        "title": doc.get("title"),
-        "poster_path":doc.get("poster_path"),
-        "vote_average": doc.get("vote_average"),
-        "vote_count": doc.get("vote_count"),
-        "release_date": rd if rd else None,
-        "tagline": doc.get("tagline"),
-        "genres": doc.get("genres"),
-        "overview": doc.get("overview"),
-    }
+    if movie:
+        r.setex(cache_key, 600, json.dumps(movie))
 
-    r.setex(cache_key, 600, json.dumps(movie))
     return movie
 
 
@@ -351,33 +287,10 @@ def get_same_genres_movies(movie_id, genres):
 
     docs = list(movies_col.aggregate(pipeline))
     
-    movies = []
-    for d in docs:
-        rd = d.get("release_date")
-        if isinstance(rd, datetime):
-            rd = rd.strftime("%Y-%m-%d")
+    movies = [parse_movie_document(d) for d in docs]
 
-        va = d.get("vote_average")
-        if va is None and d.get("rating") is not None:
-            va = float(d.get("rating"))
-
-
-        movies.append({
-            "_id": str(d["_id"]),                # el macro vol "_id"
-            "title": d.get("title"),
-            "poster_path": d.get("poster_path"),
-            "release_date": rd if rd else None,  # el macro mostra buit si None
-            "vote_average": float(va) if va is not None else None,
-            "vote_count": int(d.get("vote_count", 0)) if d.get("vote_count") is not None else None,
-            "popularity": float(d.get("popularity")) if d.get("popularity") is not None else None,
-            "weightedScore": float(d.get("weightedScore")) if d.get("weightedScore") is not None else None
-        })
-
-    # --- Guarda a la caché (TTL 300s) ---
-    r.setex(cache_key, 300, json.dumps(movies))
-
+    r.setex(cache_key, 300, json.dumps(movies, default=lambda o: o.isoformat() if isinstance(o, datetime) else o))
     return movies
-
 
 @measure
 def get_similar_movies(movie_id):
@@ -493,31 +406,7 @@ def get_similar_movies(movie_id):
         
         similar_movies = list(movies_col.aggregate(pipeline))
         
-        movies = []
-
-
-        # 6. Format data (convert ISODate to string like your placeholders)
-        for movie in similar_movies:
-            # normalitza release_date a string YYYY-MM-DD
-            rd = movie.get("release_date")
-            if isinstance(rd, datetime):
-                rd = rd.strftime("%Y-%m-%d")
-
-            # normalitza vote_average: si no hi és, agafa "rating"
-            va = movie.get("vote_average")
-            if va is None and movie.g("rating") is not None:
-                va = float(movie.g("rating"))
-
-            movies.append({
-                "_id": str(movie["_id"]),                # el macro vol "_id"
-                "title": movie.get("title"),
-                "poster_path": movie.get("poster_path"),
-                "release_date": rd if rd else None,  # el macro mostra buit si None
-                "vote_average": float(va) if va is not None else None,
-                "vote_count": int(movie.get("vote_count", 0)) if movie.get("vote_count") is not None else None,
-                "popularity": float(movie.get("popularity")) if movie.get("popularity") is not None else None,
-                "weightedScore": float(movie.get("weightedScore")) if movie.get("weightedScore") is not None else None
-            })
+        movies = [parse_movie_document(d) for d in similar_movies]
 
         r.setex(cache_key, 600, json.dumps(movies))
         return movies
@@ -683,8 +572,6 @@ def get_recommendations_for_user(username):
         
         recommended_movies = list(movies_col.aggregate(pipeline))
 
-        # Format release_date to string if it's a datetime object
-        # (This matches the format of your other service functions)
         for movie in recommended_movies:
             if isinstance(movie.get("release_date"), datetime):
                 movie["release_date"] = movie["release_date"].strftime("%Y-%m-%d")
@@ -732,4 +619,43 @@ def store_metric(metric_name: str, measure_s: float):
     Store mesured sample in seconds of the given metric
     """
     r.rpush(f"metric:{metric_name}", measure_s) # Store in milliseconds for clarity
+
+
+def parse_movie_document(doc):
+    """
+    Normalitza un document de pel·lícula (find o aggregate) perquè sigui
+    JSON-serialitzable i consistent a tota l'app.
+    """
+    if not doc:
+        return None
+
+    # --- release_date a string ---
+    rd = doc.get("release_date")
+    if isinstance(rd, datetime):
+        rd = rd.strftime("%Y-%m-%d")
+    elif isinstance(rd, (int, float)):
+        try:
+            rd = datetime.fromtimestamp(rd).strftime("%Y-%m-%d")
+        except Exception:
+            print("Error in the date.")
+            rd = None
+
+    va = doc.get("vote_average")
+    if va is None and doc.get("rating") is not None:
+        va = float(doc.get("rating"))
+    movie = {
+        "_id": str(doc.get("_id")),
+        "title": doc.get("title"),
+        "poster_path": doc.get("poster_path"),
+        "release_date": rd if rd else None,
+        "vote_average": float(va) if va is not None else None,
+        "vote_count": int(doc.get("vote_count", 0)) if doc.get("vote_count") is not None else None,
+        "popularity": float(doc.get("popularity")) if doc.get("popularity") is not None else None,
+        "weightedScore": float(doc.get("weightedScore")) if doc.get("weightedScore") is not None else None,
+        "tagline": doc.get("tagline"),
+        "genres": doc.get("genres"),
+        "overview": doc.get("overview"),
+    }
+
+    return movie
 
